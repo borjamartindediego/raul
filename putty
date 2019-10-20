@@ -1,0 +1,167 @@
+import datetime, requests, csv, logging, json, oss2, os
+
+configFile = '/opt/d3-getupdates/config.json'
+
+class GlobalConfigs:
+    def __init__(self,config_file):
+        m= "Initializing global config"
+        logging.info(m)
+        try:
+            with open(configFile) as config_file:
+                self.config = json.load(config_file)
+        except Exception as e:
+            m= "Error opening config file: %s" % e
+            logging.critical(m)
+            quit()
+        self.now = datetime.datetime.utcnow()
+        self.delta = self.config["minutes"]
+        self.nowIso = self.now.isoformat()
+        self.deltaIso = self.calc_time()
+        self.fileName = 'vodlist-' + self.now.strftime("%Y%m%d%H%M") + '.csv'
+        self.log = self.config["logFile"]
+        self.d3ApiUrl = self.config["d3ApiUrl"]
+        self.d3PlayUrl = self.config["d3PlayUrl"]
+        self.ABKeyID = self.config["ABKeyID"]
+        self.ABKeySecret = self.config["ABKeySecret"]
+        self.ABOSSEndpoint = self.config["ABOSSEndpoint"]
+        self.ABOSSBucket = self.config["ABOSSBucket"]
+        self.ABOSSBucketFolder = self.config["ABOSSBucketFolder"]
+        self.fileURL = 'https://' + self.config["ABOSSEndpoint"] + '/' + self.config["ABOSSBucket"] + '/' + self.config["ABOSSBucketFolder"] + '/' + self.fileName
+        self.SlackHook = self.config["SlackHook"]
+
+    def calc_time(self):
+        diff_minutes = datetime.timedelta(minutes=-self.delta)
+        d = self.now + diff_minutes
+        return d.isoformat()
+
+def get_d3_updates(config):
+    url = config.d3ApiUrl
+    m = "Obtaining list of updated vod content"
+    logging.info(m)
+    #v = '$range(%s,%s)&$sort=contentDate:desc' % (start, end)
+    v = '$range(%s,%s)' % (config.deltaIso, config.nowIso)
+    parameters = {'contentDate': v}
+    m = "Parameters: %s" % parameters
+    logging.debug(m)
+    try:
+        response = requests.get(url, timeout=10, params=parameters)
+        if response.status_code != 200:
+            raise Exception(response.text)
+        jresponse = response.json()
+        list = []
+        m = "Number of items found: %d" % len(jresponse['items'])
+        logging.info(m)
+        for item in jresponse['items']:
+            i = {}
+            m = "Item: %s" % item['title']
+            logging.debug(m)
+            url = config.d3PlayUrl + item['slug']
+            i['asset_title'] = item['title']
+            i['asset_name'] = item['fields']['Guid']
+            i['asset_search_input'] = url
+            i['asset_air_date'] = item['contentDate']
+			#i['catalog_name'] = "VOD_OC_CSV"
+			#i['policy_id'] = "089de2fa-a699-485f-908b-88cb1c617891"
+            list.append(i)
+        m = "Total items added: %s" % len(list)
+        logging.info(m)
+        return list
+    except Exception as e:
+        #m = "Error loading page: %s" % urlConfig['url']
+        #logging.error(m)
+        #m = e
+        #logging.error(m)
+        m = "Error getting updates from D3: %s" % e
+        logging.error(m)
+        return []
+
+def upload_oss(config):
+    try:
+        m = "Uploading file to OSS bucket %s: %s" % (config.ABOSSBucket, config.fileName)
+        logging.info(m)
+        auth = oss2.Auth (config.ABKeyID, config.ABKeySecret)
+        bucket = oss2.Bucket (auth, config.ABOSSEndpoint, config.ABOSSBucket)
+        with open(config.fileName, 'rb') as fileobj:
+            fileName = config.ABOSSBucketFolder + '/' + config.fileName
+            result = bucket.put_object(fileName, fileobj)
+        fileobj.close()
+        m = "File uploaded. Result code: %s" % result.status
+        logging.info(m)
+        os.remove(config.fileName)
+        m = "Deleted local file: %s" % config.fileName
+        logging.info(m)
+    except Exception as e:
+        m = "Error uploading to OSS: %s" % e
+        logging.error(m)
+
+def notify_slack(config,mssg):
+    m = "Sending Slack message"
+    logging.info(m)
+    message = {}
+    message['text'] = mssg
+    headers = {}
+    headers['content-type'] = 'application/json'
+    try:
+        response = requests.post(config.SlackHook,headers=headers,data=json.dumps(message))
+        m = "Slack meessage sent to: %s" % config.SlackHook
+        logging.debug(m)
+    except Exception as e:
+        #pool.makeInactive(name, tcp)
+        #print e
+        m = "Error sending slack message: %s" % e
+        logging.error(m)
+
+
+if __name__ == '__main__':
+    #timestr = time.strftime("%Y%m%d-%H%M%S")
+    #logFileName = "/var/log/warmup/Europe-Warmup-" + timestr + ".log"
+
+    logFileName = "/var/log/d3update/d3update.log"
+    logging.basicConfig(level=logging.DEBUG,format='%(asctime)s - %(levelname)s - %(message)s',filename=logFileName,filemode='a')
+
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s: %(levelname)-4s- %(message)s')
+    console.setFormatter(formatter)
+    # add the handler to the root logger
+    logging.getLogger('').addHandler(console)
+
+    m = "Script starting. Logging set-up. Log file: %s" % logFileName
+    logging.info(m)
+
+    config = GlobalConfigs(configFile)
+
+    #minutes = 480
+    #now = datetime.datetime.utcnow()
+    #d = calc_time(now, minutes)
+    m = "Time now: %s Delta: %d Difference: %s" % (config.nowIso, config.delta, config.deltaIso)
+    logging.info(m)
+    list = get_d3_updates(config)
+    #catalog_name = "VOD_OC_CSV"
+	#policy_id = "089de2fa-a699-485f-908b-88cb1c617891"
+    keys = ['asset_title', 'asset_name', 'asset_search_input', 'asset_air_date', 'catalog_name', 'policy_id']
+
+    i = 0
+    #filename = 'vodlist-' + now.strftime("%Y%m%d%H%M") + '.csv'
+    #print list
+    m = "Writting results to: %s" % config.fileName
+    logging.info(m)
+    with open(config.fileName, 'w') as csvfile:
+	       #fieldnames = ['first_name', 'last_name']
+        writer = csv.DictWriter(csvfile, fieldnames=keys)
+        writer.writeheader()
+        for line in list:
+            i = i + 1
+            writer.writerow(line)
+    csvfile.close()
+    m = "File created: %s" % config.fileName
+    logging.info(m)
+    upload_oss(config)
+    m = "File in: %s" % config.fileURL
+    logging.info(m)
+    m = "Exported latest published VOD files from last %d minutes" % config.delta
+    notify_slack(config,m)
+    m = "URL: %s" % config.fileURL
+    notify_slack(config,m)
+    m = "Script finished"
+    logging.info(m)
